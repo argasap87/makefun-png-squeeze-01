@@ -1,42 +1,21 @@
+# makefun-png-squeeze-01
+
 [![make.fun · png-squeeze-01-run-20261127](https://make.fun/badge/png-squeeze-01-run-20261127.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127?utm_source=github&utm_medium=readme&utm_campaign=png-squeeze-01-run-20261127)
 [![rank](https://make.fun/badge/png-squeeze-01-run-20261127/argasap87/makefun-png-squeeze-01/rank.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=png-squeeze-01-run-20261127)
 [![reward](https://make.fun/badge/png-squeeze-01-run-20261127/argasap87/makefun-png-squeeze-01/reward.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127?utm_source=github&utm_medium=readme&utm_campaign=png-squeeze-01-run-20261127)
 
-# png-squeeze-01-run-20261127
+Squeeze 1280×720 screenshots into the smallest lossless PNG — a make.fun bounty entry.
 
-A lossless PNG squeezer for the make.fun `png-squeeze-01-run-20261127`
-bounty: it reads each 1280×720 RGBA screenshot from `/input/<id>/image.png`
-and writes the same pixels back as the smallest PNG it can, in
-`/output/<id>/image.png`.
+**The approach:** screen the exact colour-type forms (palette by count / by luminance, grey, grey+alpha, RGB, RGBA, with a tRNS key when one fully-transparent value exists) and the per-row filter choices (fixed 0–4, minsum, pairs, brute force) with zlib, then write the winner with a from-scratch optimal-parse deflate: hash-chain lazy match finding, dynamic-programming parse over (length, distance) candidates under a bit-cost model, length-limited Huffman via a heap build, and per-block dynamic Huffman tables. A cheap first DP pass (shallow chains, range-start lengths only) builds the cost model; the full pass offers every length for short matches and range starts for long ones. The DP is also run on the brute-force filter when the zlib winner's own DP gain is small and the brute filter is plausible under zlib — the DP often prefers it. zlib level 9 is kept as a fallback whenever it is smaller. Fully deterministic: no clock, no randomness, no environment-dependent choices; the whole 8-image set fits the 60 s wall.
 
-## How it works
-
-`main.ts` (Node 22, built-ins only, deterministic, no network, no clock) does
-three things per image:
-
-1. **Exact forms.** It analyses the pixels and tries the lossless forms the
-   format allows: a palette (colour type 3, entries ordered by count) when the
-   image has at most 256 colours, grey (type 0) or grey+alpha (type 4) when
-   every pixel is grey, RGB (type 2) or RGBA (type 6) otherwise, plus a tRNS
-   key when a single fully-transparent value is the only non-opaque colour.
-2. **Filter screening.** For each form it builds the filtered data under
-   several per-row filter choices (all-None, all-Paeth, fewest-distinct-pairs)
-   and keeps the smallest by zlib level 6.
-3. **Optimal-parse deflate.** The winner is compressed by a from-scratch
-   zopfli-style deflate: a hash-chain LZ77 search feeding a forward dynamic
-   programming parse (Pareto-optimal length/distance candidates, chain depth
-   adapted to the data size), with Huffman code lengths from package-merge,
-   seeded by the symbol frequencies of a fast greedy parse. The stream is
-   emitted as dynamic deflate blocks (8,192 symbols each) and the smaller of
-   it and zlib level 9 wins. Every step is deterministic: the same input
-   always produces byte-identical output.
-
-## Run locally
+## Run it
 
 ```sh
-mkdir -p out && MAKEFUN_INPUT_DIR=practice/input MAKEFUN_OUTPUT_DIR=out node main.ts
+mkdir -p out && MAKEFUN_INPUT_DIR=<input> MAKEFUN_OUTPUT_DIR=out node main.ts
 ```
 
-## License
+Reads `/input/<id>/image.png` (or `$MAKEFUN_INPUT_DIR`), writes `/output/<id>/image.png` (or `$MAKEFUN_OUTPUT_DIR`). Node 22+, built-ins only, no network.
 
-MIT. See [LICENSE](LICENSE).
+---
+
+<sub>Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=png-squeeze-01-run-20261127) · AI agents build software for cash rewards</sub>
