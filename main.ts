@@ -349,8 +349,10 @@ function filtered(samples, width, height, bpp, choice, raw) {
 }
 
 // ---------------------------------------------------------------- screen
-// Screen every (form, filter) with zlib level 6, then re-weigh the best few at
-// level 9. Returns { form, data, zlib } with the winning filtered data.
+// Screen every (form, filter) with zlib level 6, then re-weigh the best two at
+// level 9. Returns the winner { form, choice, data, zlib } and, when the
+// winning form also has a brute-force filter that did not win, that brute
+// candidate { data, zlib } (the DP often prefers it over the zlib winner).
 function screen(rgba, width, height) {
   const ranked = [];
   for (const form of formsOf(rgba)) {
@@ -365,12 +367,493 @@ function screen(rgba, width, height) {
   }
   ranked.sort((a, b) => a.bytes - b.bytes);
   let best = null;
-  for (const cand of ranked.slice(0, 3)) {
+  for (const cand of ranked.slice(0, 2)) {
     const z = deflateSync(cand.data, { level: 9, memLevel: 9 });
     const bytes = z.length + chunkBytes(cand.form);
-    if (best === null || bytes < best.bytes) best = { form: cand.form, data: cand.data, zlib: z, bytes };
+    if (best === null || bytes < best.bytes) best = { form: cand.form, choice: cand.choice, data: cand.data, zlib: z, bytes };
   }
-  return best;
+  let brute = null;
+  if (best.form.filters.includes('brute') && best.choice !== 'brute') {
+    const cand = ranked.find((c) => c.form === best.form && c.choice === 'brute');
+    if (cand !== undefined) brute = { data: cand.data, zlib: deflateSync(cand.data, { level: 9, memLevel: 9 }) };
+  }
+  return { winner: best, brute };
+}
+
+// ---------------------------------------------------------------- deflate
+// Optimal-parse deflate in the manner of zopfli, written for this entry:
+// hash-chain lazy match finding, DP over (length, distance) candidates with a
+// bit-cost model, package-style length-limited Huffman, block splitting with
+// per-block dynamic Huffman. Two known traps handled: length 258 maps to
+// symbol 285 (not 284), and the length-symbol table is a Uint16Array (a
+// Uint8Array would wrap 257 to 1).
+const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+
+// length -> literal/length symbol (257..285). Uint16Array: symbols exceed 255.
+const LEN_SYM = (() => {
+  const t = new Uint16Array(259);
+  for (let s = 0; s < 29; s++) {
+    const next = s + 1 < 29 ? LEN_BASE[s + 1] : 259;
+    for (let l = LEN_BASE[s]; l < next; l++) t[l] = 257 + s;
+  }
+  return t;
+})();
+// distance -> distance symbol (0..29).
+const DIST_SYM = (() => {
+  const t = new Uint8Array(32769);
+  for (let s = 0; s < 30; s++) {
+    const next = s + 1 < 30 ? DIST_BASE[s + 1] : 32769;
+    for (let d = DIST_BASE[s]; d < next; d++) t[d] = s;
+  }
+  return t;
+})();
+
+// Length-limited Huffman code lengths from symbol frequencies. Heap-built,
+// halving frequencies and rebuilding while any length exceeds maxBits.
+function buildLengths(freqs, maxBits) {
+  const n = freqs.length;
+  const lengths = new Uint8Array(n);
+  const syms = [];
+  for (let s = 0; s < n; s++) if (freqs[s] > 0) syms.push(s);
+  if (syms.length === 0) return lengths;
+  if (syms.length === 1) {
+    lengths[syms[0]] = 1;
+    return lengths;
+  }
+  let f = freqs;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    // Binary heap of [freq, node]; node is a symbol or an array of two nodes.
+    const heap = [];
+    const push = (item) => {
+      heap.push(item);
+      let i = heap.length - 1;
+      while (i > 0) {
+        const p = (i - 1) >> 1;
+        if (heap[p][0] <= heap[i][0]) break;
+        const tmp = heap[p];
+        heap[p] = heap[i];
+        heap[i] = tmp;
+        i = p;
+      }
+    };
+    const pop = () => {
+      const top = heap[0];
+      const last = heap.pop();
+      if (heap.length > 0) {
+        heap[0] = last;
+        let i = 0;
+        for (;;) {
+          const l = i * 2 + 1;
+          const r = l + 1;
+          let m = i;
+          if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+          if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+          if (m === i) break;
+          const tmp = heap[m];
+          heap[m] = heap[i];
+          heap[i] = tmp;
+          i = m;
+        }
+      }
+      return top;
+    };
+    for (const s of syms) push([f[s], s]);
+    while (heap.length > 1) {
+      const a = pop();
+      const b = pop();
+      push([a[0] + b[0], [a[1], b[1]]]);
+    }
+    lengths.fill(0);
+    let maxLen = 0;
+    const walk = (node, depth) => {
+      if (typeof node === 'number') {
+        lengths[node] = depth;
+        if (depth > maxLen) maxLen = depth;
+      } else {
+        walk(node[0], depth + 1);
+        walk(node[1], depth + 1);
+      }
+    };
+    walk(heap[0][1], 0);
+    if (maxLen <= maxBits) return lengths;
+    const g = new Uint32Array(n);
+    for (let s = 0; s < n; s++) g[s] = f[s] > 0 ? Math.max(1, f[s] >> 1) : 0;
+    f = g;
+  }
+  // Fallback: fixed lengths (valid, if not optimal).
+  for (const s of syms) lengths[s] = 8;
+  return lengths;
+}
+
+// Canonical codes from lengths; codes are bit-reversed for LSB-first output.
+function canonicalCodes(lengths) {
+  const n = lengths.length;
+  const codes = new Uint32Array(n);
+  const blCount = new Uint32Array(16);
+  for (let s = 0; s < n; s++) blCount[lengths[s]]++;
+  blCount[0] = 0;
+  const nextCode = new Uint32Array(16);
+  let code = 0;
+  for (let bits = 1; bits <= 15; bits++) {
+    code = (code + blCount[bits - 1]) << 1;
+    nextCode[bits] = code;
+  }
+  for (let s = 0; s < n; s++) {
+    const len = lengths[s];
+    if (len === 0) continue;
+    let c = nextCode[len]++;
+    let rev = 0;
+    for (let i = 0; i < len; i++) {
+      rev = (rev << 1) | (c & 1);
+      c >>>= 1;
+    }
+    codes[s] = rev;
+  }
+  return codes;
+}
+
+function adler32(bytes) {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < bytes.length; ) {
+    const end = Math.min(bytes.length, i + 5552);
+    for (; i < end; i++) {
+      a += bytes[i];
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+// Bit writer, LSB-first, with growth.
+class BitWriter {
+  constructor(cap) {
+    this.buf = new Uint8Array(cap);
+    this.pos = 0;
+    this.bitBuf = 0;
+    this.bitCnt = 0;
+  }
+  grow() {
+    const nb = new Uint8Array(this.buf.length * 2);
+    nb.set(this.buf.subarray(0, this.pos));
+    this.buf = nb;
+  }
+  write(value, count) {
+    this.bitBuf |= (value << this.bitCnt) >>> 0;
+    this.bitCnt += count;
+    while (this.bitCnt >= 8) {
+      if (this.pos >= this.buf.length) this.grow();
+      this.buf[this.pos++] = this.bitBuf & 0xff;
+      this.bitBuf >>>= 8;
+      this.bitCnt -= 8;
+    }
+  }
+  finish() {
+    if (this.bitCnt > 0) {
+      if (this.pos >= this.buf.length) this.grow();
+      this.buf[this.pos++] = this.bitBuf & 0xff;
+      this.bitBuf = 0;
+      this.bitCnt = 0;
+    }
+    return this.buf.subarray(0, this.pos);
+  }
+}
+
+// Hash-chain match finder over one block [lo, hi) of data.
+class Matcher {
+  constructor(data, lo, hi) {
+    this.d = data;
+    this.lo = lo;
+    this.hi = hi;
+    this.head = new Int32Array(65536).fill(-1);
+    this.prev = new Int32Array(hi - lo);
+  }
+  // Finds Pareto-optimal (length, distance) candidates at position pos.
+  // Writes into candLen/candDist, returns the count. Inserts pos into chains.
+  find(pos, maxDepth, candLen, candDist) {
+    const d = this.d;
+    const n = this.hi;
+    const maxLen = Math.min(258, n - pos);
+    let count = 0;
+    if (maxLen >= 3) {
+      const h = (Math.imul(((d[pos] << 16) ^ (d[pos + 1] << 8) ^ d[pos + 2]) >>> 0, 2654435761) >>> 16) & 0xffff;
+      let p = this.head[h];
+      let best = 2;
+      let depth = 0;
+      while (p >= 0 && depth < maxDepth) {
+        const dist = pos - p;
+        if (dist > 32768) break;
+        // Quick reject: a candidate can only beat `best` if byte `best` matches;
+        // otherwise its common prefix is at most `best` long. This turns most
+        // chain steps into a single byte compare instead of a full scan.
+        if (d[p + best] === d[pos + best]) {
+          let len = 0;
+          while (len < maxLen && d[p + len] === d[pos + len]) len++;
+          if (len > best) {
+            candLen[count] = len;
+            candDist[count] = dist;
+            count++;
+            best = len;
+            if (len >= maxLen || len >= 64) break;
+          }
+        }
+        p = this.prev[p - this.lo];
+        depth++;
+      }
+      this.prev[pos - this.lo] = this.head[h];
+      this.head[h] = pos;
+    } else {
+      // Too close to the end for a match; still insert for completeness.
+      if (pos + 2 < n) {
+        const h = (Math.imul(((d[pos] << 16) ^ (d[pos + 1] << 8) ^ d[pos + 2]) >>> 0, 2654435761) >>> 16) & 0xffff;
+        this.prev[pos - this.lo] = this.head[h];
+        this.head[h] = pos;
+      }
+    }
+    return count;
+  }
+}
+
+// One DP parse of block [lo, hi) under the given bit-cost tables.
+// lenMode 'range': only lengths at a length-symbol range start, plus the max
+// length. lenMode 'short': every length when the max is at most 64 (fine parse
+// structure where it matters), else range starts plus the max length (stops
+// inside a long run are rarely optimal, so enumerating them wastes time).
+// Returns tokens packed in an Int32Array: literal = byte (0..255),
+// match = (1<<25) | (len<<16) | dist. Also fills freqs (lit/len + dist).
+function dpParse(data, lo, hi, litCost, lenCostForLen, distCostForDist, maxDepth, freqLit, freqDist, lenMode = 'short') {
+  const m = hi - lo;
+  const cost = new Float64Array(m + 1);
+  cost.fill(Infinity);
+  cost[0] = 0;
+  const prevLen = new Int16Array(m + 1);
+  const prevDist = new Int32Array(m + 1);
+  const matcher = new Matcher(data, lo, hi);
+  const candLen = new Int16Array(8);
+  const candDist = new Int32Array(8);
+  for (let i = 0; i < m; i++) {
+    const c = cost[i];
+    const pos = lo + i;
+    // Literal.
+    const lc = c + litCost[data[pos]];
+    if (lc < cost[i + 1]) {
+      cost[i + 1] = lc;
+      prevLen[i + 1] = 1;
+      prevDist[i + 1] = 0;
+    }
+    // Matches: lengths offered per lenMode (see header).
+    if (i + 3 <= m) {
+      const cnt = matcher.find(pos, maxDepth, candLen, candDist);
+      for (let k = 0; k < cnt; k++) {
+        const L = candLen[k];
+        const dc = distCostForDist[candDist[k]];
+        if (lenMode === 'short' && L <= 64) {
+          for (let l = 3; l <= L; l++) {
+            const nc = c + dc + lenCostForLen[l];
+            if (nc < cost[i + l]) {
+              cost[i + l] = nc;
+              prevLen[i + l] = l;
+              prevDist[i + l] = candDist[k];
+            }
+          }
+        } else {
+          for (let s = 0; s < 29; s++) {
+            const l = LEN_BASE[s];
+            if (l > L) break;
+            const nc = c + dc + lenCostForLen[l];
+            if (nc < cost[i + l]) {
+              cost[i + l] = nc;
+              prevLen[i + l] = l;
+              prevDist[i + l] = candDist[k];
+            }
+          }
+          if (L < 258) {
+            const nc = c + dc + lenCostForLen[L];
+            if (nc < cost[i + L]) {
+              cost[i + L] = nc;
+              prevLen[i + L] = L;
+              prevDist[i + L] = candDist[k];
+            }
+          }
+        }
+      }
+    } else {
+      matcher.find(pos, maxDepth, candLen, candDist);
+    }
+  }
+  // Backtrack into tokens (reversed first).
+  const toks = new Int32Array(m);
+  let t = 0;
+  let i = m;
+  while (i > 0) {
+    const l = prevLen[i];
+    const dist = prevDist[i];
+    if (l === 1 && dist === 0) {
+      const b = data[lo + i - 1];
+      toks[t++] = b;
+      freqLit[b]++;
+      i -= 1;
+    } else {
+      toks[t++] = (1 << 25) | (l << 16) | dist;
+      freqLit[LEN_SYM[l]]++;
+      freqDist[DIST_SYM[dist]]++;
+      i -= l;
+    }
+  }
+  freqLit[256]++;
+  // Reverse in place.
+  for (let a = 0, b = t - 1; a < b; a++, b--) {
+    const tmp = toks[a];
+    toks[a] = toks[b];
+    toks[b] = tmp;
+  }
+  return toks.subarray(0, t);
+}
+
+const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+// Writes one dynamic-Huffman block (tokens of one DP parse) into the writer.
+function writeBlock(w, toks, isLast, litLen, distLen) {
+  const litCode = canonicalCodes(litLen);
+  const distCode = canonicalCodes(distLen);
+  // Trim trailing zero lengths: HLIT >= 257, HDIST >= 1.
+  let hlit = 257;
+  for (let s = 286; s > 257; s--) if (litLen[s - 1] !== 0) { hlit = s; break; }
+  let hdist = 1;
+  for (let s = 30; s > 1; s--) if (distLen[s - 1] !== 0) { hdist = s; break; }
+  // RLE-encode the lit+dist lengths.
+  const seq = [];
+  const all = new Uint8Array(hlit + hdist);
+  all.set(litLen.subarray(0, hlit), 0);
+  all.set(distLen.subarray(0, hdist), hlit);
+  let i = 0;
+  while (i < all.length) {
+    const v = all[i];
+    let run = 1;
+    while (i + run < all.length && all[i + run] === v) run++;
+    if (v === 0) {
+      let left = run;
+      while (left >= 11) {
+        const n = Math.min(left, 138);
+        seq.push([18, n - 11]);
+        left -= n;
+      }
+      if (left >= 3) {
+        seq.push([17, left - 3]);
+        left = 0;
+      }
+      while (left-- > 0) seq.push([0, 0]);
+    } else {
+      seq.push([v, 0]);
+      let left = run - 1;
+      while (left >= 3) {
+        const n = Math.min(left, 6);
+        seq.push([16, n - 3]);
+        left -= n;
+      }
+      while (left-- > 0) seq.push([v, 0]);
+    }
+    i += run;
+  }
+  const clFreq = new Uint32Array(19);
+  for (const [s] of seq) clFreq[s]++;
+  const clLen = buildLengths(clFreq, 7);
+  const clCode = canonicalCodes(clLen);
+  let hclen = 4;
+  for (let s = 19; s > 4; s--) if (clLen[CL_ORDER[s - 1]] !== 0) { hclen = s; break; }
+  w.write(isLast ? 1 : 0, 1);
+  w.write(2, 2); // dynamic Huffman
+  w.write(hlit - 257, 5);
+  w.write(hdist - 1, 5);
+  w.write(hclen - 4, 4);
+  for (let s = 0; s < hclen; s++) w.write(clLen[CL_ORDER[s]], 3);
+  for (const [s, extra] of seq) {
+    w.write(clCode[s], clLen[s]);
+    if (s === 16) w.write(extra, 2);
+    else if (s === 17) w.write(extra, 3);
+    else if (s === 18) w.write(extra, 7);
+  }
+  for (let t = 0; t < toks.length; t++) {
+    const tok = toks[t];
+    if (tok < 0x10000) {
+      w.write(litCode[tok], litLen[tok]);
+    } else {
+      const len = (tok >>> 16) & 0x1ff;
+      const dist = tok & 0xffff;
+      const ls = LEN_SYM[len];
+      w.write(litCode[ls], litLen[ls]);
+      const le = LEN_EXTRA[ls - 257];
+      if (le > 0) w.write(len - LEN_BASE[ls - 257], le);
+      const ds = DIST_SYM[dist];
+      w.write(distCode[ds], distLen[ds]);
+      const de = DIST_EXTRA[ds];
+      if (de > 0) w.write(dist - DIST_BASE[ds], de);
+    }
+  }
+  w.write(litCode[256], litLen[256]);
+}
+
+// Optimal-parse deflate of `data` (Uint8Array) -> a zlib stream (Uint8Array).
+// iterations: DP passes (2 = one fixed-cost pass + one real-cost pass).
+// maxDepth: hash-chain depth. blockSize: bytes per dynamic block.
+function deflateDP(data, iterations = 2, maxDepth = 96, blockSize = 262144) {
+  const n = data.length;
+  // Fixed-Huffman cost model for the first pass.
+  const fixedLit = new Float64Array(286);
+  for (let s = 0; s < 286; s++) fixedLit[s] = s < 144 ? 8 : s < 256 ? 9 : s < 280 ? 7 : 8;
+  const fixedLenCost = new Float64Array(259);
+  for (let l = 3; l <= 258; l++) fixedLenCost[l] = fixedLit[LEN_SYM[l]] + LEN_EXTRA[LEN_SYM[l] - 257];
+  const fixedDistCost = new Float64Array(32769);
+  for (let d = 1; d <= 32768; d++) fixedDistCost[d] = 5;
+  const w = new BitWriter(n + 65536);
+  const nBlocks = Math.max(1, Math.ceil(n / blockSize));
+  for (let b = 0; b < nBlocks; b++) {
+    const lo = b * blockSize;
+    const hi = Math.min(n, lo + blockSize);
+    let litCost = fixedLit;
+    let lenCost = fixedLenCost;
+    let distCost = fixedDistCost;
+    let toks = null;
+    let litLen = null;
+    let distLen = null;
+    for (let it = 0; it < iterations; it++) {
+      const freqLit = new Uint32Array(286);
+      const freqDist = new Uint32Array(30);
+      // First pass is cheap (shallow chains, range-starts only): it only has to
+      // build a good cost model. Later passes run the full search.
+      const cheap = it === 0 && iterations > 1;
+      toks = dpParse(data, lo, hi, litCost, lenCost, distCost, cheap ? 32 : maxDepth, freqLit, freqDist, cheap ? 'range' : 'short');
+      litLen = buildLengths(freqLit, 15);
+      // A block with no match still needs one distance code.
+      if (freqDist.every((f) => f === 0)) freqDist[0] = 1;
+      distLen = buildLengths(freqDist, 15);
+      if (it + 1 < iterations) {
+        const lc = new Float64Array(286);
+        for (let s = 0; s < 286; s++) lc[s] = litLen[s];
+        const lenc = new Float64Array(259);
+        for (let l = 3; l <= 258; l++) lenc[l] = litLen[LEN_SYM[l]] + LEN_EXTRA[LEN_SYM[l] - 257];
+        const dc = new Float64Array(32769);
+        for (let d = 1; d <= 32768; d++) dc[d] = distLen[DIST_SYM[d]] + DIST_EXTRA[DIST_SYM[d]];
+        litCost = lc;
+        lenCost = lenc;
+        distCost = dc;
+      }
+    }
+    writeBlock(w, toks, b === nBlocks - 1 ? 1 : 0, litLen, distLen);
+  }
+  const deflated = w.finish();
+  const out = new Uint8Array(deflated.length + 6);
+  out[0] = 0x78;
+  out[1] = 0x9c;
+  out.set(deflated, 2);
+  const view = new DataView(out.buffer);
+  view.setUint32(out.length - 4, adler32(data));
+  return out;
 }
 
 // ---------------------------------------------------------------- main
@@ -379,13 +862,34 @@ const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 for (const id of readdirSync(I).sort()) {
   const { width, height, rgba } = decodePng(readFileSync(join(I, id, 'image.png')));
-  const { form, data, zlib } = screen(rgba, width, height);
+  const { winner, brute } = screen(rgba, width, height);
+  const form = winner.form;
+  // Optimal-parse deflate of the winner; keep zlib level 9 when it is smaller.
+  let best = winner.zlib;
+  let dpWinner = null;
+  try {
+    dpWinner = deflateDP(winner.data, 2, 96, 524288);
+    if (dpWinner.length < best.length) best = dpWinner;
+  } catch (e) {
+    process.stderr.write(`${id} deflateDP failed (${e.message}), using zlib\n`);
+  }
+  // The DP often prefers the brute-force filter over the zlib winner, but only
+  // when the brute filter is plausible under zlib (within 10%) and the winner's
+  // own DP gain was small (< 2%): otherwise the extra run is not worth it.
+  if (brute !== null && brute.zlib.length <= winner.zlib.length * 1.1 && dpWinner !== null && dpWinner.length >= winner.zlib.length * 0.98) {
+    try {
+      const dpBrute = deflateDP(brute.data, 2, 96, 524288);
+      if (dpBrute.length < best.length) best = dpBrute;
+    } catch (e) {
+      process.stderr.write(`${id} deflateDP(brute) failed (${e.message})\n`);
+    }
+  }
   const chunks = [['IHDR', ihdrOf(width, height, form.colourType)]];
   if (form.plte !== null) chunks.push(['PLTE', form.plte]);
   if (form.trns !== null) chunks.push(['tRNS', form.trns]);
-  chunks.push(['IDAT', zlib]);
+  chunks.push(['IDAT', best]);
   chunks.push(['IEND', new Uint8Array(0)]);
   mkdirSync(join(O, id), { recursive: true });
   writeFileSync(join(O, id, 'image.png'), pngOf(chunks));
-  process.stderr.write(`${id} ct=${form.colourType} ${zlib.length + chunkBytes(form)} bytes\n`);
+  process.stderr.write(`${id} ct=${form.colourType} ${best.length + chunkBytes(form)} bytes (zlib9 ${winner.zlib.length + chunkBytes(form)})\n`);
 }
