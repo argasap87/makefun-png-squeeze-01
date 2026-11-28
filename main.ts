@@ -238,7 +238,7 @@ function formsOf(rgba) {
         samples: p.indices,
         plte: p.plte,
         trns: p.trns,
-        filters: order === 'count' ? [0] : [0, 'minsum', 'brute'],
+        filters: order === 'count' ? [0] : [0, 'minsum'],
       });
     }
     if (!grey) return forms;
@@ -260,7 +260,7 @@ function formsOf(rgba) {
     samples: samplesOf(rgba, ct),
     plte: null,
     trns,
-    filters: [0, 1, 2, 4, 'minsum', 'pairs', 'brute'],
+    filters: [0, 1, 2, 4, 'minsum'],
   });
   return forms;
 }
@@ -349,8 +349,8 @@ function filtered(samples, width, height, bpp, choice, raw) {
 }
 
 // ---------------------------------------------------------------- screen
-// Screen every (form, filter) with zlib level 6, then re-weigh the best two at
-// level 9. Returns the winner { form, choice, data, zlib } and, when the
+// Screen every (form, filter) with zlib level 1 (fast ranking; the top two
+// are re-weighed at level 9), then re-weigh the best two at level 9.
 // winning form also has a brute-force filter that did not win, that brute
 // candidate { data, zlib } (the DP often prefers it over the zlib winner).
 function screen(rgba, width, height) {
@@ -361,7 +361,7 @@ function screen(rgba, width, height) {
     const buf = new Uint8Array(size);
     for (const choice of form.filters) {
       const data = filtered(form.samples, width, height, form.bpp, choice, buf);
-      const z = deflateSync(data, { level: 6, memLevel: 8 });
+      const z = deflateSync(data, { level: 1, memLevel: 8 });
       ranked.push({ form, choice, bytes: z.length + chunks, data: data.slice() });
     }
   }
@@ -799,7 +799,8 @@ function writeBlock(w, toks, isLast, litLen, distLen) {
 }
 
 // Optimal-parse deflate of `data` (Uint8Array) -> a zlib stream (Uint8Array).
-// iterations: DP passes (2 = one fixed-cost pass + one real-cost pass).
+// iterations: DP passes (1 = a single fixed-cost pass; the old 2-pass form
+// cost ~2x the time for a small gain and is dropped for the 60 s wall).
 // maxDepth: hash-chain depth. blockSize: bytes per dynamic block.
 function deflateDP(data, iterations = 2, maxDepth = 96, blockSize = 262144) {
   const n = data.length;
@@ -827,7 +828,7 @@ function deflateDP(data, iterations = 2, maxDepth = 96, blockSize = 262144) {
       // First pass is cheap (shallow chains, range-starts only): it only has to
       // build a good cost model. Later passes run the full search.
       const cheap = it === 0 && iterations > 1;
-      toks = dpParse(data, lo, hi, litCost, lenCost, distCost, cheap ? 32 : maxDepth, freqLit, freqDist, cheap ? 'range' : 'short');
+      toks = dpParse(data, lo, hi, litCost, lenCost, distCost, cheap ? 16 : maxDepth, freqLit, freqDist, 'range');
       litLen = buildLengths(freqLit, 15);
       // A block with no match still needs one distance code.
       if (freqDist.every((f) => f === 0)) freqDist[0] = 1;
@@ -868,22 +869,13 @@ for (const id of readdirSync(I).sort()) {
   let best = winner.zlib;
   let dpWinner = null;
   try {
-    dpWinner = deflateDP(winner.data, 2, 96, 524288);
+    dpWinner = deflateDP(winner.data, 1, 24, 524288);
     if (dpWinner.length < best.length) best = dpWinner;
   } catch (e) {
     process.stderr.write(`${id} deflateDP failed (${e.message}), using zlib\n`);
   }
-  // The DP often prefers the brute-force filter over the zlib winner, but only
-  // when the brute filter is plausible under zlib (within 10%) and the winner's
-  // own DP gain was small (< 2%): otherwise the extra run is not worth it.
-  if (brute !== null && brute.zlib.length <= winner.zlib.length * 1.1 && dpWinner !== null && dpWinner.length >= winner.zlib.length * 0.98) {
-    try {
-      const dpBrute = deflateDP(brute.data, 2, 96, 524288);
-      if (dpBrute.length < best.length) best = dpBrute;
-    } catch (e) {
-      process.stderr.write(`${id} deflateDP(brute) failed (${e.message})\n`);
-    }
-  }
+  // (No brute-force filter anymore: it cost ~3600 deflateSync calls per form
+  // and the DP second run, for a marginal size gain. Time is the constraint.)
   const chunks = [['IHDR', ihdrOf(width, height, form.colourType)]];
   if (form.plte !== null) chunks.push(['PLTE', form.plte]);
   if (form.trns !== null) chunks.push(['tRNS', form.trns]);
